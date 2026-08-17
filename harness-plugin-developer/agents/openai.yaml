@@ -1,0 +1,4 @@
+interface:
+  display_name: "Harness Plugin Development"
+  short_description: "Build DeepSeek Harness plugins end to end"
+  default_prompt: "Build a DeepSeek Harness plugin for me"
