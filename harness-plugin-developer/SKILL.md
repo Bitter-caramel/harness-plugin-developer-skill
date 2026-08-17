@@ -25,6 +25,7 @@ You are a senior architect for the DeepSeek Harness plugin ecosystem. The Knowle
    - Getting started: `docs/user/develop/basic/index.md` (first plugin), `tool.md`, `config.md`, `publish.md`
    - Development guide: `docs/user/develop/framework/` (lifecycle, services, events), `docs/user/develop/practice/` (LLM adapter, capability layering)
    - Reference: `docs/cookbook/adding-a-tool.md` (full tool contract), `docs/config-catalog.md` (every settable config key), `docs/tool-catalog.md`, `docs/subsystems/` (built-in service APIs), `docs/testing.md`, `apps/cli/reference/README.md` (CLI behavior)
+   - Core mechanism sources: `packages/bundle/base/cordis.patch.yml` (the 78 built-in rows), `packages/core/system-prompt`, `packages/compaction`, `packages/llm/token-meter`, `packages/spill`, `packages/session`, `packages/session-query`
    - Copyable minimal template: `scratch-plugin/` (`cordis.yml` + `src/my-plugin.ts`)
 4. Reality-check table (wrong ideas to actively correct):
 
@@ -34,6 +35,10 @@ You are a senior architect for the DeepSeek Harness plugin ecosystem. The Knowle
 | A `harness` field in `package.json` | The real field is `dsh.bundle` (see bundle manifest below) |
 | `harness plugins --patch ./my-plugin` | Hot-mounting is `dsh web --patch <overlay.yml>` — the `--patch` argument is a YAML overlay, not a plugin directory. Permanent install is `dsh plugin --profile <name> add <pkg>` |
 | A `resources/` directory convention | No such convention. A dev plugin is "one TS module + one cordis.yml overlay"; a distributable bundle is "package.json + cordis.patch.yml + entry JS" |
+| Override a row's `name` to swap implementations | `name` mismatch warns and skips the patch (`applyEntryPatches`). Disable the row and insert your own (§10) |
+| Loading a second provider swaps a service at runtime | One implementation per context — a duplicate provider throws (see `SpillStore` docstring). Disable the old row first |
+| `intercept` wraps or replaces a service implementation | It only merges per-entry service **config** (`Config.merge` or shallow assign); no wrapping (§3) |
+| Every core mechanism can be swapped by plugin | Only the verified surfaces in §9; e.g. `agent-loop` is a concrete driver — swap the row, customize the surrounding rows |
 
 ## Quick Start (the 90% path)
 
@@ -146,6 +151,16 @@ There is no separate `override`/`unmount` operation in this version.
 
 Entry fields (loader `EntryOptions` plus the isolation extensions in `vendor/loader/src/config/isolate.ts`): `id`, `name` (module specifier), `config`, `group`, `disabled`, `inject`, `intercept`, `isolate` (service-isolation realms, e.g. `isolate: { shell: true }` on a group row).
 
+`intercept` semantics (verified in `vendor/loader/src/config/isolate.ts` + `vendor/cordis/lib/types/service.js`): per-entry **config** interception for services the entry consumes — not an implementation wrapper. The loader applies `entry.options.intercept` to the entry's context; when a service resolves its config, intercept entries merge over it (ancestors first; the service's `Config.merge` when declared, else a shallow assign). The programmatic equivalent is `ctx.intercept('llm', { temperature: 0.2 })`, which returns a child context carrying the intercept (see `docs/cordis-api/context.md`). An entry's `inject` may also use the object form, mapping services to intercept config.
+
+```yaml
+- id: scoped-consumer
+  name: './src/consumer.ts'
+  intercept:
+    llm:
+      temperature: 0.2      # merged into ctx.llm's resolved config for this entry's subtree only
+```
+
 ```yaml
 - insert:
     - id: hello                        # stable row id; later layers override by id
@@ -157,6 +172,7 @@ Entry fields (loader `EntryOptions` plus the isolation extensions in `vendor/loa
 
 - Row semantics: `disabled: true` stops a row (and its descendants); `group: true` makes the row a nested group whose `config` is a child entry list.
 - **Later layers win per row.** An override assigns each provided key onto the target row, and `config` is replaced **wholesale — no deep merge** — so when overriding a row, restate every key it needs.
+- **An override cannot change a row's `name`**: a patch whose `name` does not match the target row's `name` warns and is skipped (`applyEntryPatches`). To swap a built-in implementation, disable the row and insert your own (recipe in §10).
 - Layer order (empty root → composed): bundle patches listed in the profile's `dsh.profile.bundles` (in order, `@deepseek-ai/dsh-base` first) → the profile's own `cordis.patch.yml` → home-level `$DSH_HOME/cordis.patch.yml` → each `--patch <path>` overlay in argv order.
 - `!!js` expressions in config values are evaluated by the loader against the row's injected services, e.g. `port: !!js ctx.webStartup.port ?? 3080`. They stay unevaluated in `--dump-config` output. When overriding a row's `config`, **keep the `!!js` expression** — replacing it with a literal removes the runtime read:
 
@@ -405,20 +421,145 @@ dsh --profile web --dump-default-config                 # bundle layers only
 dsh --profile headless "run the tests"                  # one-shot task: result on stdout, exit 0/1
 ```
 
-### 8. Built-in services (excerpt — full API in `docs/subsystems/`)
+### 8. Built-in services (verified subset; full API in `docs/subsystems/`)
 
-- `tools` — tool registry: `ctx.tools.register(defineTool(...))`
-- `llm` — model adapters: `ctx.llm.registerAdapter(providers, adapter)`
-- `agents` — agent registry
-- Others: `shell`, `workspace`, `terminal`, `web`, `skills` — not enumerated here; consult the generated blocks in `docs/subsystems/*.md` (or the source interfaces) at use time. Facts not in this KB are verified in the checkout, never assumed.
+- `tools` — tool registry: `ctx.tools.register(defineTool(...))`; row `tools` = `@deepseek-ai/dsh-tools`
+- `agents` — live agent coordination registry
+- `llm` — adapter rows `llm-deepseek` / `llm-pi-ai`; `ctx.llm.registerAdapter` and default provider/model routing are mapped in §9
+- `systemPrompt`, `compaction`, `tokenMeter`, `spillStore`, `sessionPersistence`, `sessionQuery`, `sessionProjections` — mechanism → row → source is mapped in §9
+- Others: `shell`, `workspace`, `terminal`, `web`, `skills`, ... — consult the generated blocks in `docs/subsystems/*.md` (or the source interfaces) at use time. Facts not in this KB are verified in the checkout, never assumed.
 
-### 9. Testing
+### 9. Core pluggability map
+
+Harness is "everything is a plugin": the core mechanisms are rows of the base bundle (`packages/bundle/base/cordis.patch.yml`, 78 rows) that expose Cordis services. Verified customization surfaces:
+
+| Mechanism | Verified surface | Row (`id` → package) | Source |
+| --- | --- | --- | --- |
+| System prompt assembly | `ctx.systemPrompt`: register `PromptSection` (`order`: `-100` harness identity, `0` persona, `100–199` tool guidance), `PromptContext`, `variable`; a section with `complete: true` becomes the sole prompt section. Events: `system-prompt/assemble` (scoped waterfall, returned value authoritative), `system-prompt/change` | `system-prompt` → `@deepseek-ai/dsh-system-prompt` (config `persona`) | `packages/core/system-prompt/src/index.ts` |
+| Workspace instructions (AGENTS.md) | Config-driven loader plugin; consumers read injected baseline instructions | `agent-instructions` → `@deepseek-ai/dsh-agent-instructions` (config `maxBytes: 65536`) | `packages/context/agent-instructions/src/index.ts` |
+| Conversation compaction | `ctx.compaction`: subclass abstract `CompactionEngine` (`compactIfNeeded`, `compactNow`, `compactRegion`) | `compaction-basic` → `@deepseek-ai/dsh-compaction-basic` | `packages/compaction/compaction/src/index.ts` |
+| Token metering | `ctx.tokenMeter` (`TokenMeter` service) | `token-meter` → `@deepseek-ai/dsh-token-meter` | `packages/llm/token-meter/src/index.ts` |
+| Spill storage (large tool results) | `ctx.spillStore`: subclass abstract `SpillStore` (`saveText`); one implementation per context | `spill-local` → `@deepseek-ai/dsh-spill-local`; budget row `spill-policy` (`maxInlineBytes: 50000`) | `packages/spill/spill/src/index.ts` |
+| Session persistence | `ctx.sessionPersistence` (`SessionPersistence` service) | `session-persistence-jsonl` → `@deepseek-ai/dsh-session-persistence-jsonl` (config `root: !!js dshHomePath('sessions')`); a sqlite backend exists in `packages/session/session-persistence-sqlite` | `packages/session/session-persistence/src/index.ts` |
+| Session query / retrieval | `ctx.sessionQuery`: subclass abstract `SessionQueryEngine` (static `inject = ['sessions']`) | `session-query-sqlite` → `@deepseek-ai/dsh-session-query-sqlite` (config `path`, `openAt`) | `packages/session-query/session-query/src/index.ts` |
+| Session projections | `ctx.sessionProjections`: `.register()` projection definitions | `session-projection` → `@deepseek-ai/dsh-session-projection` | `packages/session/session-projection/src/index.ts` |
+| Model routing | `ctx.llm.registerAdapter`; per-agent default provider/model from the row below | `llm` → `@deepseek-ai/dsh-llm`; `agent-default-model` → `@deepseek-ai/dsh-agent-default-model` (config `provider`, `model`) | `packages/llm/*` |
+| Agent loop driver | Concrete plugin that creates `ReactLoopAgent`s and publishes them through the agent/session registries; the practical customization surface is the surrounding rows (system prompt, instructions, default model, policies) | `agent-loop` → `@deepseek-ai/dsh-agent-loop` (config `agents: []`) | `packages/core/agent-loop/src/index.ts` |
+| Durability / pruning policies | Checkpoint before each model request; oversized tool-result pruning before compaction | `session-checkpoint-policy`, `tool-result-pruner` (`thresholdChars/headChars/tailChars`) | `packages/session/session-checkpoint-policy`, `packages/compaction/compaction-tool-result-pruner` |
+
+Only these verified surfaces are asserted here. If a mechanism is not in this table, verify its shape in the checkout before claiming it is pluggable.
+
+### 10. Replacing built-in components: three approaches
+
+**(a) Disable the built-in row, insert your own — the default for swapping an implementation**
+
+- An override cannot change a row's `name` (warn + skip, §3), and loading a second provider of a service throws (Cordis standard duplicate-service behavior; see the `SpillStore` docstring) — so disable the old provider first.
+- Consumers `inject` the service name, not the row, so dependents keep working and reload automatically (§1).
+
+```yaml
+# profile cordis.patch.yml or a --patch overlay
+- id: compaction-basic
+  disabled: true
+- insert:
+    - id: my-compaction
+      name: '/absolute/path/src/my-compaction.ts'
+      config:
+        myThresholdTokens: 50000
+```
+
+**(b) Intercept config — per-entry tuning, no new implementation**
+
+- `intercept` (or the object form of `inject`, or `ctx.intercept(name, config)`) merges config into a service for a subtree of entries (§3).
+- Use it for deployment-level knobs (timeouts, budgets, temperatures) on an existing implementation. It cannot change behavior the service's config schema does not express.
+
+**(c) New service provider + isolation**
+
+- Provide your own implementation with the class form (§5.1). Either take over an existing service name (disable the old provider first, per (a)) or introduce a new service name that consumers opt into via `inject`.
+- Scope it with `isolate` (§3) when only some plugin groups should see your implementation: `isolate: { compaction: true }` gives a group a private instance; a string label (`isolate: { compaction: 'tenant-a' }`) shares one realm across entries.
+
+Tradeoffs: (a) full control, most code, replaces globally unless scoped via group/isolate; (b) cheapest, limited to config-exposed knobs; (c) cleanest seam for multi-tenant or deployment-specific behavior, requires the consumer surface to be inject-driven.
+
+### 11. Walkthrough: custom compaction engine
+
+Goal: replace `compaction-basic` with a custom engine (verified against `packages/compaction/*`).
+
+1. Locate the row: `- id: compaction-basic, name: '@deepseek-ai/dsh-compaction-basic'` in `packages/bundle/base/cordis.patch.yml`.
+2. Choose approach (a): disable + insert.
+3. Implement by subclassing `CompactionEngine` (the service behind `ctx.compaction`). Minimal compiling stub (a real backend implements the strategy bodies):
+
+```ts
+// src/my-compaction.ts
+import type { Context } from '@deepseek-ai/cordis'
+import { CompactionEngine } from '@deepseek-ai/dsh-compaction'
+import type { CompactionAgentContext, CompactionResult, CompactionTrigger, ManualCompactAgentContext } from '@deepseek-ai/dsh-compaction'
+import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
+
+export default class MyCompactionEngine extends CompactionEngine {
+  async compactIfNeeded(
+    _agent: CompactionAgentContext,
+    _trigger: CompactionTrigger,
+    _signal: AbortSignal,
+  ): Promise<CompactionResult | null> {
+    return null // automatic pressure policy: implement here
+  }
+
+  async compactNow(
+    _agent: ManualCompactAgentContext,
+    _signal: AbortSignal,
+    _sourceCommandId?: CommandId,
+  ): Promise<CompactionResult | null> {
+    return null // manual /compact: implement here
+  }
+
+  async compactRegion(
+    _start: number,
+    _end: number,
+    _agent: CompactionAgentContext,
+    _signal?: AbortSignal,
+  ): Promise<CompactionResult> {
+    throw new Error('not implemented') // span replacement: implement here; async rejects the returned promise instead of throwing synchronously
+  }
+}
+```
+
+Add a Schemastery `Config` and a `constructor(ctx, config)` (§5.2) when the engine needs tunables (see `compaction-basic`'s constructor shape).
+
+4. Overlay: disable + insert as in §10(a).
+5. Verify:
+   - `dsh --profile web --dump-config` — the `compaction-basic` row is `disabled: true` and `my-compaction` appears after it (the dump order is the load order).
+   - Run `/compact` as a smoke test — the `command-compact` consumer (`inject = ['commands', 'compaction']`) still resolves `ctx.compaction`.
+   - Add the HMR-safety test (§14): dispose the engine's fiber and assert cleanup and dependent reload.
+   - Boot logs are auxiliary only: a class-loading line (if your implementation logs one) confirms loading, but its absence is not a failure signal.
+
+Contract notes (from `CompactionEngine` JSDoc): a run replaces a balanced surface span with one summary node; the replacement user message must use `compactCheckpointSource` with the transaction's `CompactionId`; forward cancellation signals; prevent concurrent compaction of the same session.
+
+### 12. Core components working together
+
+- Consumers inject **services, not rows**: `command-compact` injects `['commands', 'compaction']`; `compaction-basic` reads `ctx.tokenMeter`. Replacing a provider behind the same service name keeps consumers intact (§1).
+- Compose through events (§5.5): `system-prompt/assemble` is a scoped waterfall — core prompt plugins contribute sections without knowing each other, and the returned assembly is authoritative.
+- Layer order decides (§3): profile `cordis.patch.yml` → `$DSH_HOME/cordis.patch.yml` → `--patch` overlays. Keep one row per concern and override its `config` there instead of adding competing providers.
+- Isolation boundaries: group + `isolate` gives separate service instances per plugin group (§3) — use it when two plugin sets must not share a core component instance (e.g., per-tenant compaction or spill backends).
+
+### 13. Performance-oriented customization
+
+Candidate hot paths — confirm each one on the user's composition before optimizing: system-prompt assembly, tool-schema assembly, workspace-instruction injection (`maxBytes` budget), compaction trigger checks (token-meter pressure), spill inline budget (`maxInlineBytes`), and persistence flushes/checkpoints (`session-checkpoint-policy`).
+
+Method — no claims without measurements:
+
+1. Baseline first: measure the current composition on a representative workload (per-turn wall-clock, `tokenMeter` context-pressure/breakdown projections, spill usage) before touching anything.
+2. Change ONE component at a time; keep the rest of the composition identical.
+3. Re-run the same workload and compare; snapshot both compositions with `--dump-config`.
+4. Automate the workload as a vitest benchmark or a reproducible headless run (see §14 Testing).
+
+This skill documents the method only. Never state performance gains ("X% faster", "uses less tokens") that were not measured on the user's own workload.
+
+### 14. Testing
 
 - Follow `docs/testing.md`. Unit tests use vitest and live in `tests/**` next to the code they exercise.
 - Required convention for registries: an HMR-safety test that disposes the contributing fiber and asserts cleanup (every registration is revoked).
 - Prefer edge cases, error paths, event ordering, and concurrency races; mock only the expensive boundary (LLM adapter, network, clock).
 
-### 10. Common pitfalls
+### 15. Common pitfalls
 
 - Relative plugin paths in local overlays fail to resolve — use absolute paths.
 - Patch overrides replace the whole `config`; restate every key or you silently drop the rest.
@@ -428,7 +569,7 @@ dsh --profile headless "run the tests"                  # one-shot task: result 
 - TS-only bundles fail under the installed CLI — ship built JS, and provide a `prepare` script for git installs.
 - Hardcoded tunables: deployment-varying parameters must be `Config` fields with Schemastery defaults.
 
-### 11. Delivery checklist
+### 16. Delivery checklist
 
 - [ ] Plugin exports `name` (and required `inject`) plus `apply(ctx, config?)` — the `config` parameter only when the plugin takes configuration
 - [ ] `Config` interface and the same-name Schemastery `Schema` match; no hardcoded tunables
@@ -436,4 +577,7 @@ dsh --profile headless "run the tests"                  # one-shot task: result 
 - [ ] `pnpm dsh web --patch ...` runs and prints the load log
 - [ ] If bundling: `dsh.bundle.patch` points at the real `cordis.patch.yml`, entry files are in `files`, built JS is shipped
 - [ ] `--dump-config` shows the layer in the right order
+- [ ] Core customization: the built-in row `id`/`name` being replaced is confirmed against `packages/bundle/base/cordis.patch.yml`
+- [ ] The old provider row is `disabled: true` before inserting a provider for the same service (duplicate providers throw)
+- [ ] Unverified facts are marked "needs verification" (Ground Rules)
 - [ ] User was asked: Option A (permanent install) or Option B (on-demand `--patch`)
