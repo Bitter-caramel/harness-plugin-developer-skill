@@ -41,6 +41,23 @@ You are a senior architect for the DeepSeek Harness plugin ecosystem. The Knowle
 | `intercept` wraps or replaces a service implementation | It only merges per-entry service **config** (`Config.merge` or shallow assign); no wrapping (§3) |
 | Every core mechanism can be swapped by plugin | Only the verified surfaces in §9; e.g. `agent-loop` is a concrete driver — swap the row, customize the surrounding rows |
 
+## Knowledge Base Version Anchor
+
+This KB is bound to a specific revision of the upstream checkout. Read this anchor before trusting any number below.
+
+- **Pinned revision**: `D:\Ai\deepseek-harness` at commit `99f6f02fecdb7dff40c3fbc9470f5907c29f74ca` (branch `master`), pulled 2026-08-18 09:09:43 +0800 — read from the plain-text files `.git/refs/heads/master` and `.git/logs/HEAD`. If the checkout has moved past this sha, re-verify affected facts before use.
+- **Bound fact set**:
+  - The 78 built-in rows and their ids in `packages/bundle/base/cordis.patch.yml` (§9, §9.5, §10).
+  - The offline doc index in Ground Rule 3 (`docs/user/develop/*`, `docs/cookbook/*`, `docs/subsystems/*`, ...).
+  - The verified interface signatures: system-prompt section/event surface, `CompactionEngine`, `TokenMeter`, `SpillStore`, `SessionPersistence`, `SessionQueryEngine`, `defineTool`, `LlmAdapter` (§5, §9, §11).
+- **Upstream-change comparison** (run after the checkout is updated):
+  1. Fetch upstream and fast-forward the checkout (an environment step, not a KB fact).
+  2. Re-read `.git/refs/heads/<branch>` and `.git/logs/HEAD` for the new sha and date.
+  3. Compare the key evidence: row count and ids in `packages/bundle/base/cordis.patch.yml` (was 78), `docs/user/develop/*`, and the signatures above.
+  4. Differences → update the affected sections, re-verify each claim with `rg`, update the pinned sha/date here, then re-sync the three copies (authoritative → single-file → Codex install).
+  5. No differences → update only the pinned sha/date.
+- **Authority rule**: when the KB and the checkout disagree, **the checkout wins**. Record the difference, correct the KB, and never argue from the stale text.
+
 ## Quick Start (the 90% path)
 
 Minimal local plugin (function form is the default; object and class forms are in the Knowledge Base):
@@ -449,6 +466,39 @@ Harness is "everything is a plugin": the core mechanisms are rows of the base bu
 | Durability / pruning policies | Checkpoint before each model request; oversized tool-result pruning before compaction | `session-checkpoint-policy`, `tool-result-pruner` (`thresholdChars/headChars/tailChars`) | `packages/session/session-checkpoint-policy`, `packages/compaction/compaction-tool-result-pruner` |
 
 Only these verified surfaces are asserted here. If a mechanism is not in this table, verify its shape in the checkout before claiming it is pluggable.
+
+#### 9.5 Impact analysis and design decisions
+
+Replacing a core component never happens in isolation: every surface in §9 has consumers, event contracts, and state readers. Walk this matrix and checklist before choosing an approach in §10. All rows are source-verified against the checkout pinned in the Knowledge Base Version Anchor; anything derived beyond them must be marked "needs verification".
+
+**Linkage matrix (verified)**
+
+| Surface | What a replacement inherits (source-verified) | Source |
+| --- | --- | --- |
+| system-prompt | Assembly runs as the scoped waterfall `system-prompt/assemble`; the returned assembly is authoritative. `complete: true` makes a section the sole prompt; two effective complete sections throw. A replacement must keep the `ctx.systemPrompt` surface and emit `system-prompt/change` on updates. | `packages/core/system-prompt/src/index.ts` |
+| agent-instructions | Baseline instructions enter the session as **user messages** (`source.kind === 'agent-instructions'`) before the first request — it does not register prompt sections, so it stacks with system-prompt at a different layer (session content vs system prompt). It listens to `session/event`, `agent/pre-step`, `tools/result`, reads the optional `ctx.fs`, and mounts as a no-op without an fs provider. | `packages/context/agent-instructions/src/index.ts` |
+| compaction | `compaction-basic` injects `['llm', 'tokenMeter', 'sessions']` and its pressure decision reads `ctx.tokenMeter.measure(session)` on `agent/pre-step` — a token-meter replacement therefore changes compaction triggering. A run replaces a balanced surface span with one summary node and appends the replacement as session events, so persistence and session-query see the summary like any other event. It also listens to `agent/status`, `session/event`, `agent/request-error`; no spill usage was found in the package. | `packages/compaction/compaction-basic/src/index.ts`, `packages/compaction/compaction/src/index.ts` |
+| token-meter | `measure(session)` is O(surface) and returns a detached measurement. It registers its context-breakdown projection through `ctx.inject(['sessionProjections'])` — replacing it changes both compaction triggers and projected breakdowns. | `packages/llm/token-meter/src/index.ts` |
+| spill / spill-policy | spill-policy is a `tools/post-execute` transformer: results over `maxInlineBytes` are saved through `ctx.spillStore` and replaced in-session by a notice; the spilled text stays outside the session file. Best-effort by design: no session owner, no backend, or a save failure logs and returns the original result — a spill failure must never fail the tool. `spill-local` stores under `<root>/session-<hash>/…` (0600 files, 0700 root; config `root` or a lazily-created private root). | `packages/spill/spill-policy/src/index.ts`, `packages/spill/spill-local/src/index.ts` |
+| session persistence | `session-persistence-jsonl` writes one append-only JSONL file per session (config `root`, `writeBatchMaxDelayMs`). `session-checkpoint-policy` injects `['llm', 'sessionPersistence', 'sessions', 'tools']` and checkpoints model requests (`llm/stream`) and top-level tool calls **before** dispatch — a checkpoint rejection prevents the request. A replacement must keep the `SessionPersistence` contract and leave `session/flush` consumers working. | `packages/session/session-persistence-jsonl/src/index.ts`, `packages/session/session-checkpoint-policy/src/index.ts` |
+| session-query | `static inject = ['sessions']` — it reads live sessions, not a storage backend. Anything that stops appending events to sessions silently degrades search/read results without breaking loading. | `packages/session-query/session-query/src/index.ts` |
+| session projections | `.register()` units are driven by `session/event`; a replacement projection must re-register on reload (HMR-safety, §14). token-meter contributes a projection through this registry. | `packages/session/session-projection/src/index.ts`, `packages/llm/token-meter/src/index.ts` |
+| model routing | Adapters register via `ctx.llm.registerAdapter`; `agent-default-model` picks the per-agent provider/model. `compaction-basic` routes its summarizer to the same provider/model as the latest request (`routedTarget` reads the session request header) — routing changes propagate to compaction summarization. | `packages/llm/*`, `packages/compaction/compaction-basic/src/index.ts` |
+| agent-loop | Concrete driver, not a service seam: it injects `['agents', 'sessions', 'llm', 'tools', 'systemPrompt']`, creates `ReactLoopAgent`s, publishes them through the registries, and opens a child context injecting `sessionPersistence`. Swap the row; customize the surrounding rows (§9). | `packages/core/agent-loop/src/index.ts` |
+| checkpoint-policy / tool-result-pruner | Durability pair around requests and compaction: the checkpoint policy delays model/tool dispatch until the logged prefix is durable; the pruner deterministically trims oversized tool-result surface nodes (head/middle/tail) before compaction. Both are policy rows — override their config, or disable + replace if you need different semantics. | `packages/session/session-checkpoint-policy/src/index.ts`, `packages/compaction/compaction-tool-result-pruner/src/index.ts` |
+| intercept / isolate | From §3: `intercept` only merges **config** (no wrapping); `isolate` gives a plugin group a private service instance. Neither substitutes for a replacement — use them to scope a replacement or tune it per group. | `vendor/loader/src/config/isolate.ts` |
+| events | Verified core events to respect: `system-prompt/assemble` (scoped waterfall), `system-prompt/change`, `agent/pre-step`, `agent/status`, `agent/request-error`, `session/created`, `session/event`, `session/disposed`, `session/flush`, `tools/post-execute`, `tools/code-dispatch-log`, `llm/stream`. A replacement must keep emitting every event its consumers filter on. | `packages/core`, `packages/compaction`, `packages/session`, `packages/spill`, `packages/context` |
+
+**Decision checklist**
+
+1. **Justify the replacement.** Config-only needs → §10(b) `intercept`. A new capability seam → §10(c) new service name. Swap an implementation → §10(a) disable + insert, only when config and events cannot express the need.
+2. **Consumer audit.** `rg "<service>"` for `inject` in the checkout. Consumers inject the service name, so they keep working after a swap (§1) — but only if your replacement honors the same surface.
+3. **Event audit.** List what the old component emits and consumes (matrix above) and keep the emits; dropping an event breaks listeners silently — nothing fails at load time.
+4. **State audit.** Find who reads the component's state (e.g., `compaction-basic` reads `ctx.tokenMeter.measure`; the checkpoint policy reads `sessionPersistence`); replacing one changes the other's behavior even if it still loads.
+5. **Config layering.** Profile `cordis.patch.yml` → `$DSH_HOME/cordis.patch.yml` → `--patch`; `config` replaces wholesale (§3); keep one row per concern.
+6. **Rollback plan.** Keep the replacement in its own overlay file: removing that overlay restores the built-in. Snapshot `--dump-config` before and after, and disable the old row rather than editing it.
+7. **Default composition (when nothing needs replacing).** `compaction-basic` + `token-meter` + `spill-local` with `spill-policy` + `session-persistence-jsonl` + `session-query-sqlite` + `agent-loop`, customizing only the surrounding rows (system prompt, instructions, default model, policies). This is the combination every linkage row above assumes.
+8. **Unverified derivations.** Any relationship not in the matrix (or not found in the checkout) must be marked "needs verification" before it is asserted in code or conversation.
 
 ### 10. Replacing built-in components: three approaches
 
